@@ -13,5 +13,10 @@ class CaseForm(BaseModel):
     payload: dict[str, Any]
 
 
+class CaseUpdateForm(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    payload: dict[str, Any]
+
+
 class ReviewForm(BaseModel):
     note: str = Field(min_length=1, max_length=500)

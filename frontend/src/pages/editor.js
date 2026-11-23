@@ -10,21 +10,30 @@ export function editorPage(state, identity) {
   const original = state.cases.find(row=>row.id===identity);
   const payload = original?.payload || state.spec.sample;
   state.draft = payload;
+  const latest = original ? state.plans.find(row=>row.case_id===original.id) : null;
+  const latestLine = latest ? `<p class="note">当前方案 v${latest.version} · 保留截止日 ${esc(latest.cutoff)}。修改源数据后原方案将失效，需重新预览。</p>` : '';
   return `${heading(topic.modules[1], state.spec.guidance)}
-    <form id="case-form"><label class="field title-field"><span>档案名称</span><input name="title" required maxlength="120" value="${esc((original?.title || state.spec.name) + ' · 复核')}" /></label>
-    <div class="field-grid">${fields(payload, state.spec.field_labels)}</div><div class="actions form-actions"><button>保存并提交执行</button><a class="secondary" href="#cases">返回档案</a></div></form>`;
+    <form id="case-form"><label class="field title-field"><span>档案名称</span><input name="title" required maxlength="120" value="${esc((original?.title || state.spec.name) + (original ? '' : ' · 复核'))}" /></label>
+    ${latestLine}
+    <div class="field-grid">${fields(payload, state.spec.field_labels)}</div><div class="actions form-actions"><button>保存并预览方案</button><a class="secondary" href="#cases">返回档案</a></div></form>`;
 }
 
 export function bindEditor(state, api, fail) {
   submit('case-form', async data=>{
     const payload = readFields(state.draft, state.spec.field_labels);
-    const draft = await api('/cases', {method:'POST', data:{title:data.get('title'), payload}});
+    const original = state.cases.find(row=>row.id===Number(location.hash.split('/')[1]));
+    let saved;
+    if (original) {
+      saved = await api(`/cases/${original.id}`, {method:'PUT', data:{title:data.get('title'), payload}});
+    } else {
+      saved = await api('/cases', {method:'POST', data:{title:data.get('title'), payload}});
+    }
     try {
-      const run = await api(`/cases/${draft.id}/runs`, {method:'POST'});
-      go(`runs/${run.id}`);
+      const plan = await api(`/cases/${saved.id}/plans`, {method:'POST'});
+      go(`plans/${plan.id}`);
     } catch (error) {
-      go(`cases/${draft.id}`);
-      fail(new Error(`档案已保存。提交执行失败：${error.message}`));
+      go(`cases/${saved.id}`);
+      fail(new Error(`档案已保存。方案预览失败：${error.message}`));
     }
   }, fail);
 }

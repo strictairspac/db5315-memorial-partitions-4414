@@ -1,5 +1,5 @@
 from sqlalchemy import (JSON, Column, ForeignKey, Integer, MetaData, String,
-                        Table, Text)
+                        Table, Text, UniqueConstraint)
 
 schema = MetaData()
 users = Table('accounts', schema,
@@ -26,12 +26,34 @@ runs = Table('business_runs', schema,
     Column('error', Text))
 evidence = Table('business_evidence', schema,
     Column('id', Integer, primary_key=True),
-    Column('run_id', ForeignKey('business_runs.id'), nullable=False, unique=True),
+    Column('run_id', ForeignKey('business_runs.id'), nullable=True, unique=True),
+    Column('plan_id', ForeignKey('retention_plans.id'), nullable=True, unique=True),
     Column('report', JSON, nullable=False),
     Column('digest', String(64), nullable=False),
     Column('reviewer', String(40)),
     Column('review_note', String(500)),
     Column('reviewed_at', String(32)))
+plans = Table('retention_plans', schema,
+    Column('id', Integer, primary_key=True),
+    Column('case_id', ForeignKey('business_cases.id'), nullable=False, index=True),
+    Column('version', Integer, nullable=False),
+    Column('plan_key', String(64), nullable=False, unique=True),
+    Column('cutoff', String(10), nullable=False),
+    Column('payload', JSON, nullable=False),
+    Column('source_digest', String(64), nullable=False),
+    Column('baseline_plan_id', ForeignKey('retention_plans.id')),
+    Column('baseline_evidence_id', Integer),
+    Column('baseline_evidence_digest', String(64)),
+    Column('baseline_evidence_signature', String(64)),
+    Column('status', String(20), nullable=False, index=True),
+    Column('preview', JSON, nullable=False),
+    Column('preview_digest', String(64), nullable=False),
+    Column('report', JSON),
+    Column('rejection_reason', String(500)),
+    Column('error', Text),
+    Column('author', String(40), nullable=False),
+    Column('created_at', String(32), nullable=False),
+    Column('applied_at', String(32)))
 audit = Table('audit_events', schema,
     Column('id', Integer, primary_key=True),
     Column('actor', String(40), nullable=False),

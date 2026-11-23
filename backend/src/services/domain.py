@@ -9,6 +9,9 @@ from sqlalchemy import text
 REGISTERED = '在册'
 PENDING = '待挂载'
 DEFAULT = 'DEFAULT 待核池'
+ONLINE = '在线账簿'
+ARCHIVE = '摘除表'
+ABSENT = '不在本次账簿'
 
 SPEC = {
     'name': '松门纪念园·入园凭条分区',
@@ -24,7 +27,7 @@ SPEC = {
         'slip_id': '凭条编号',
         'entered_on': '入园日期',
     },
-    'guidance': '日期填 YYYY-MM-DD。分区填月初，状态填「在册」或「待挂载」。次月月初等于或早于截止日即整月到期。',
+    'guidance': '日期填 YYYY-MM-DD。分区填月初，状态填「在册」或「待挂载」。次月月初等于或早于截止日即整月到期。调整截止日先看方案预览，再确认生效。',
     'sample': {
         'cutoff': '2026-09-01',
         'partitions': [
@@ -116,6 +119,143 @@ def validate(payload):
     _parse(payload)
 
 
+def _decide(months, cutoff):
+    """Derive the mount/detach plan from validated input. Pure, side-effect free."""
+    registered = {month.start for month in months if month.state == REGISTERED}
+    detached = {month.start for month in months if month.state == REGISTERED and month.end <= cutoff}
+    attached = {month.start for month in months if month.state == PENDING and month.end > cutoff}
+    mounted = registered | attached
+    online = mounted - detached
+    return registered, attached, detached, mounted, online
+
+
+def _route_slips(months, cutoff, slips):
+    """Compute every slip's destination without touching PostgreSQL."""
+    registered, attached, detached, mounted, online = _decide(months, cutoff)
+    by_start = {month.start: month for month in months}
+    rows = []
+    for slip_id in sorted(slips, key=lambda item: (slips[item], item)):
+        entered_on = slips[slip_id]
+        start = entered_on.replace(day=1)
+        month = by_start.get(start)
+        initial_label = month.label if month and month.start in registered else DEFAULT
+        if start in mounted:
+            label = month.label
+            location = ARCHIVE if start in detached else ONLINE
+        else:
+            label, location = DEFAULT, DEFAULT
+        if location == ARCHIVE:
+            disposition = '摘除表已核实'
+        elif location == DEFAULT:
+            disposition = '截止日前待复核' if entered_on < cutoff else '等待挂载'
+        elif initial_label == DEFAULT:
+            disposition = '已从待核池回补'
+        else:
+            disposition = '在线留存'
+        rows.append({
+            '凭条编号': slip_id, '入园日期': entered_on.isoformat(),
+            '初始去向': initial_label, '去向': label, '位置': location, '核验结果': disposition,
+        })
+    return rows
+
+
+def _partition_rows(months, cutoff, slip_rows):
+    registered, attached, detached, mounted, online = _decide(months, cutoff)
+    rows = []
+    for month in months:
+        start = month.start
+        if start in detached:
+            action, destination = '整月到期，将摘除', ARCHIVE
+        elif start in attached:
+            action, destination = '仍在保留期，将挂载回补', ONLINE
+        elif month.state == PENDING:
+            action, destination = '整月到期，略过挂载', None
+        else:
+            action, destination = '仍在保留期，继续挂载', ONLINE
+        counts = Counter(row['位置'] for row in slip_rows if row['去向'] == month.label)
+        rows.append({
+            '分区月份': month.label, '下界（含）': start.isoformat(), '上界（不含）': month.end.isoformat(),
+            '登记状态': month.state, '计划处置': action, '计划位置': destination or '未建立',
+            '在线张数': counts[ONLINE], '摘除张数': counts[ARCHIVE], '待核张数': counts[DEFAULT],
+            '分区张数': sum(counts.values()),
+        })
+    return rows
+
+
+def preview(payload, baseline=None):
+    """Describe the impact of a cutoff plan before it is applied.
+
+    ``baseline`` is the structured state of the latest committed evidence, or None.
+    """
+    cutoff, months, slips = _parse(payload)
+    slip_rows = _route_slips(months, cutoff, slips)
+    partition_rows = _partition_rows(months, cutoff, slip_rows)
+    old_slips = (baseline or {}).get('slips') or {}
+    old_parts = (baseline or {}).get('partitions') or {}
+
+    rows = []
+    for row in slip_rows:
+        previous = old_slips.get(row['凭条编号'])
+        old_label = previous['分区'] if previous else '首次入账'
+        old_location = previous['位置'] if previous else '首次入账'
+        changed = old_label != row['去向'] or old_location != row['位置']
+        rows.append({
+            '凭条编号': row['凭条编号'], '入园日期': row['入园日期'],
+            '原去向': old_label, '原位置': old_location,
+            '新去向': row['去向'], '新位置': row['位置'], '变化': '是' if changed else '否',
+            '核验结果': row['核验结果'],
+        })
+    known = {row['凭条编号'] for row in slip_rows}
+    for slip_id, previous in sorted(old_slips.items()):
+        if slip_id in known:
+            continue
+        rows.append({
+            '凭条编号': slip_id, '入园日期': previous['入园日期'],
+            '原去向': previous['分区'], '原位置': previous['位置'],
+            '新去向': ABSENT, '新位置': '未入账', '变化': '是', '核验结果': '本次账簿未包含，将移出',
+        })
+    rows.sort(key=lambda row: (row['入园日期'], row['凭条编号']))
+
+    partitions = []
+    for row in partition_rows:
+        previous = old_parts.get(row['分区月份']) or {}
+        old_location = previous.get('位置', '未建立')
+        changed = old_location != row['计划位置']
+        partitions.append({**row, '原位置': old_location, '变化': '是' if changed else '否'})
+    for label in sorted(old_parts):
+        if any(row['分区月份'] == label for row in partitions):
+            continue
+        previous = old_parts[label]
+        partitions.append({
+            '分区月份': label, '下界（含）': previous.get('下界', ''), '上界（不含）': previous.get('上界', ''),
+            '登记状态': previous.get('登记状态', ''), '计划处置': '本次账簿未包含，将移出分区目录',
+            '计划位置': '未建立', '在线张数': 0, '摘除张数': 0, '待核张数': 0, '分区张数': 0,
+            '原位置': previous.get('位置', '未建立'), '变化': '是',
+        })
+
+    online_rows = [row for row in rows if row['新位置'] == ONLINE or row['原位置'] == ONLINE]
+    archive_rows = [row for row in rows if row['新位置'] == ARCHIVE or row['原位置'] == ARCHIVE]
+    counts = Counter(row['新位置'] for row in rows)
+    restored = sum(row['原位置'] == ARCHIVE and row['新位置'] == ONLINE for row in rows)
+    newly_archived = sum(row['原位置'] != ARCHIVE and row['新位置'] == ARCHIVE for row in rows)
+    removed = sum(row['原位置'] in (ONLINE, ARCHIVE) and row['新位置'] == '未入账' for row in rows)
+    unchanged = sum(row['变化'] == '否' for row in rows)
+    added = sum(row['原位置'] == '首次入账' for row in rows)
+    return {
+        'cutoff': cutoff.isoformat(),
+        'partitions': partitions,
+        'slips': rows,
+        'online': online_rows,
+        'archived': archive_rows,
+        'summary': {
+            '分区目录': len(partitions), '分区目录变化': sum(row['变化'] == '是' for row in partitions),
+            '在线凭条': counts[ONLINE], '摘除凭条': counts[ARCHIVE], '待核凭条': counts[DEFAULT],
+            '新入账': added, '移出账簿': removed, '新增摘除': newly_archived,
+            '摘除后回到在线': restored, '去向不变': unchanged,
+        },
+    }
+
+
 def _read_slips(conn, tables):
     observed = {}
     for table in tables:
@@ -168,66 +308,71 @@ def _backfill(conn, parent, default, table, month):
     conn.execute(text(f'ALTER TABLE pg_temp.{parent} ATTACH PARTITION pg_temp.{table} {month.sql_bounds}'))
 
 
-def solve(payload, engine):
+def solve_in(conn, payload, baseline=None):
+    """Mount, detach and reconcile in one transaction on ``conn``.
+
+    The caller owns the transaction. Any exception leaves the previous committed
+    state untouched and makes PostgreSQL roll the temporary objects away.
+    """
     cutoff, months, slips = _parse(payload)
     parent = f'gb5315_{uuid4().hex}'
     default = f'{parent}_default'
     tables = {month.start: f'{parent}_m{month.label.replace("-", "")}' for month in months}
-    registered = {month.start: tables[month.start] for month in months if month.state == REGISTERED}
-    attached = {month.start: tables[month.start] for month in months if month.state == PENDING and month.end > cutoff}
-    detached = {month.start: tables[month.start] for month in months if month.state == REGISTERED and month.end <= cutoff}
-    mounted = registered | attached
-    online = {start: table for start, table in mounted.items() if start not in detached}
+    registered, attached, detached, mounted, online = _decide(months, cutoff)
+    registered_tables = {month.start: tables[month.start] for month in months if month.start in registered}
+    attached_tables = {month.start: tables[month.start] for month in months if month.start in attached}
+    detached_tables = {month.start: tables[month.start] for month in months if month.start in detached}
+    mounted_tables = registered_tables | attached_tables
+    online_tables = {start: table for start, table in mounted_tables.items() if start not in detached}
 
-    with engine.begin() as conn:
-        conn.execute(text("SET LOCAL DateStyle = 'ISO, YMD'"))
-        conn.execute(text(f'''
-            CREATE TEMP TABLE pg_temp.{parent} (
-                slip_id text NOT NULL, entered_on date NOT NULL
-            ) PARTITION BY RANGE (entered_on) ON COMMIT DROP
-        '''))
-        for month in months:
-            if month.start in registered:
-                table = registered[month.start]
-                conn.execute(text(f'''
-                    CREATE TEMP TABLE pg_temp.{table} PARTITION OF pg_temp.{parent}
-                    {month.sql_bounds} ON COMMIT DROP
-                '''))
-        conn.execute(text(f'''
-            CREATE TEMP TABLE pg_temp.{default} PARTITION OF pg_temp.{parent} DEFAULT ON COMMIT DROP
-        '''))
-        if slips:
-            rows = [{'slip_id': slip_id, 'entered_on': entered_on} for slip_id, entered_on in slips.items()]
+    conn.execute(text("SET LOCAL DateStyle = 'ISO, YMD'"))
+    conn.execute(text(f'''
+        CREATE TEMP TABLE pg_temp.{parent} (
+            slip_id text NOT NULL, entered_on date NOT NULL
+        ) PARTITION BY RANGE (entered_on) ON COMMIT DROP
+    '''))
+    for month in months:
+        if month.start in registered:
+            table = registered_tables[month.start]
             conn.execute(text(f'''
-                INSERT INTO pg_temp.{parent} (slip_id, entered_on) VALUES (:slip_id, :entered_on)
-            '''), rows)
-        initial = _read_slips(conn, [parent])
-        _verify_slips(initial, slips, registered, default, '初始分流')
+                CREATE TEMP TABLE pg_temp.{table} PARTITION OF pg_temp.{parent}
+                {month.sql_bounds} ON COMMIT DROP
+            '''))
+    conn.execute(text(f'''
+        CREATE TEMP TABLE pg_temp.{default} PARTITION OF pg_temp.{parent} DEFAULT ON COMMIT DROP
+    '''))
+    if slips:
+        rows = [{'slip_id': slip_id, 'entered_on': entered_on} for slip_id, entered_on in slips.items()]
+        conn.execute(text(f'''
+            INSERT INTO pg_temp.{parent} (slip_id, entered_on) VALUES (:slip_id, :entered_on)
+        '''), rows)
+    initial = _read_slips(conn, [parent])
+    _verify_slips(initial, slips, registered_tables, default, '初始分流')
 
-        for month in months:
-            if month.start in attached:
-                _backfill(conn, parent, default, attached[month.start], month)
-        filled = _read_slips(conn, [parent])
-        _verify_slips(filled, slips, mounted, default, '挂载回补')
-        mounted_bounds = _read_bounds(conn, parent)
-        if mounted_bounds.keys() != {default, *mounted.values()}:
-            raise RuntimeError('挂载核对失败，PostgreSQL 分区目录与计划不一致')
+    for month in months:
+        if month.start in attached:
+            _backfill(conn, parent, default, attached_tables[month.start], month)
+    filled = _read_slips(conn, [parent])
+    _verify_slips(filled, slips, mounted_tables, default, '挂载回补')
+    mounted_bounds = _read_bounds(conn, parent)
+    if mounted_bounds.keys() != {default, *mounted_tables.values()}:
+        raise RuntimeError('挂载核对失败，PostgreSQL 分区目录与计划不一致')
 
-        for table in detached.values():
-            conn.execute(text(f'ALTER TABLE pg_temp.{parent} DETACH PARTITION pg_temp.{table}'))
-        remaining = _read_slips(conn, [parent])
-        archived = _read_slips(conn, detached.values())
-        if remaining.keys() & archived.keys():
-            raise RuntimeError('摘除核对失败，凭条同时存在于在线账簿和摘除表')
-        final = remaining | archived
-        _verify_slips(final, slips, mounted, default, '摘除后对账')
-        final_bounds = _read_bounds(conn, parent)
-        if final_bounds.keys() != {default, *online.values()}:
-            raise RuntimeError('摘除核对失败，PostgreSQL 分区目录与到期计划不一致')
-        if any(leaf not in final_bounds for _, leaf in remaining.values()):
-            raise RuntimeError('摘除核对失败，在线账簿与 PostgreSQL 分区目录不一致')
-        if any(leaf in final_bounds for _, leaf in archived.values()):
-            raise RuntimeError('摘除核对失败，摘除表仍在 PostgreSQL 分区目录中')
+    for table in detached_tables.values():
+        conn.execute(text(f'ALTER TABLE pg_temp.{parent} DETACH PARTITION pg_temp.{table}'))
+    remaining = _read_slips(conn, [parent])
+    archived = _read_slips(conn, detached_tables.values())
+    if remaining.keys() & archived.keys():
+        raise RuntimeError('摘除核对失败，凭条同时存在于在线账簿和摘除表')
+    final = remaining | archived
+    _verify_slips(final, slips, mounted_tables, default, '摘除后对账')
+    final_bounds = _read_bounds(conn, parent)
+    if final_bounds.keys() != {default, *online_tables.values()}:
+        raise RuntimeError('摘除核对失败，PostgreSQL 分区目录与到期计划不一致')
+    if any(leaf not in final_bounds for _, leaf in remaining.values()):
+        raise RuntimeError('摘除核对失败，在线账簿与 PostgreSQL 分区目录不一致')
+    if any(leaf in final_bounds for _, leaf in archived.values()):
+        raise RuntimeError('摘除核对失败，摘除表仍在 PostgreSQL 分区目录中')
 
     labels = {tables[month.start]: month.label for month in months}
     labels[default] = DEFAULT
@@ -272,7 +417,7 @@ def solve(payload, engine):
         })
     moved = initial_counts[default] - filled_counts[default]
     overdue = sum(leaf == default and day < cutoff for day, leaf in remaining.values())
-    return {
+    report = {
         'summary': f'按 {cutoff} 核验 {len(slips)} 张凭条，回补 {moved} 张，摘除 {len(archived)} 张，待复核 {online_counts[default]} 张。',
         'metrics': {
             '收到凭条': len(slips), '初始待核凭条': initial_counts[default], '回补凭条': moved,
@@ -289,4 +434,65 @@ def solve(payload, engine):
             {'title': '月分区处置', 'rows': month_rows},
             {'title': '逐张凭条去向', 'rows': slip_rows},
         ],
+        'state': {
+            'cutoff': cutoff.isoformat(),
+            'partitions': {
+                month.label: {
+                    '登记状态': month.state,
+                    '位置': ONLINE if month.start in online else (ARCHIVE if month.start in detached else '未建立'),
+                    '下界': month.start.isoformat(), '上界': month.end.isoformat(),
+                    '边界': mounted_bounds.get(tables[month.start], '未挂载'),
+                }
+                for month in months
+            },
+            'slips': {
+                slip_id: {
+                    '入园日期': entered_on.isoformat(),
+                    '分区': labels[final[slip_id][1]],
+                    '位置': ARCHIVE if slip_id in archived else (DEFAULT if final[slip_id][1] == default else ONLINE),
+                }
+                for slip_id, entered_on in slips.items()
+            },
+        },
     }
+    _attach_comparison(report, baseline)
+    return report
+
+
+def _attach_comparison(report, baseline):
+    """Add old/new destinations to an applied report, relative to the baseline state."""
+    old_slips = (baseline or {}).get('slips') or {}
+    rows = report['sections'][2]['rows']
+    for row in rows:
+        previous = old_slips.get(row['凭条编号'])
+        row['原去向'] = previous['分区'] if previous else '首次入账'
+        row['原位置'] = previous['位置'] if previous else '首次入账'
+        row['新去向'] = row['最终存放']
+        row['新位置'] = report['state']['slips'][row['凭条编号']]['位置']
+        row['变化'] = '是' if (row['原去向'], row['原位置']) != (row['新去向'], row['新位置']) else '否'
+    known = {row['凭条编号'] for row in rows}
+    for slip_id, previous in sorted(old_slips.items()):
+        if slip_id in known:
+            continue
+        rows.append({
+            '凭条编号': slip_id, '入园日期': previous['入园日期'],
+            '初始路由': '—', '挂载后路由': '—', '最终存放': ABSENT,
+            '核验结果': '本次账簿未包含，已移出', '原去向': previous['分区'], '原位置': previous['位置'],
+            '新去向': ABSENT, '新位置': '未入账', '变化': '是',
+        })
+    rows.sort(key=lambda row: (row['入园日期'], row['凭条编号']))
+    changed = sum(row['变化'] == '是' for row in rows)
+    report['metrics']['去向变化'] = changed
+    report['metrics']['去向不变'] = len(rows) - changed
+    if old_slips:
+        report['metrics']['摘除后回到在线'] = sum(
+            row['原位置'] == ARCHIVE and row['新位置'] == ONLINE for row in rows)
+        report['metrics']['本次新摘除'] = sum(
+            row['原位置'] != ARCHIVE and row['新位置'] == ARCHIVE for row in rows)
+        report['metrics']['移出账簿'] = sum(
+            row['原位置'] in (ONLINE, ARCHIVE) and row['新位置'] == '未入账' for row in rows)
+
+
+def solve(payload, engine):
+    with engine.begin() as conn:
+        return solve_in(conn, payload)

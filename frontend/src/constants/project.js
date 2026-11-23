@@ -7,5 +7,6 @@ export const topic = {
     "生命周期执行",
     "回收核验"
   ],
+  "planModule": "方案预览",
   "algorithm": "真实 PostgreSQL 范围分区分流、迟到凭条回补并核验保留期边界"
 };
